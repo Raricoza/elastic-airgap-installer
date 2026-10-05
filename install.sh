@@ -727,6 +727,16 @@ configure_elasticsearch() {
 -Xmx${heap_mb}m
 EOF
 
+  # When binding to a specific IP, also bind to loopback so Fleet Server's
+  # internal monitoring components (which default to 127.0.0.1) can reach ES.
+  # http.publish_host ensures ES advertises only the user-selected IP externally.
+  local net_host_yaml="$NETWORK_HOST"
+  local publish_host_yaml=""
+  if [[ "$NETWORK_HOST" != "0.0.0.0" && "$NETWORK_HOST" != "127.0.0.1" ]]; then
+    net_host_yaml="[\"${NETWORK_HOST}\", \"_local_\"]"
+    publish_host_yaml="http.publish_host: ${NETWORK_HOST}"
+  fi
+
   cat > "$conf" <<EOF
 # ── Elastic Stack — Single-node (Air-Gapped) ─────────────────────────────────
 cluster.name: ${CLUSTER_NAME}
@@ -736,8 +746,9 @@ node.name: ${NODE_NAME}
 path.data: ${ES_DATA_DIR}
 path.logs: ${ES_LOG_DIR}
 
-# Network
-network.host: ${NETWORK_HOST}
+# Network — bound to selected IP plus loopback for internal Fleet monitoring
+network.host: ${net_host_yaml}
+${publish_host_yaml}
 http.port: 9200
 
 # Single-node discovery (no cluster formation)
