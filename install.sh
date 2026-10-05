@@ -617,16 +617,19 @@ recover_es_password() {
   done < <(ls -t "${SCRIPT_DIR}"/elastic-install-*.log 2>/dev/null \
     | grep -v "$(basename "$LOG_FILE")" || true)
 
-  if [[ -n "$recovered" ]]; then
-    if curl -skf "${ES_LOCAL_URL}/_cluster/health" \
-        -u "elastic:${recovered}" -o /dev/null 2>/dev/null; then
-      ES_PASSWORD="$recovered"
-      info "Recovered elastic password from previous install log"
-      return 0
-    fi
-    info "Found previous password in log but it no longer works — prompting"
+  if [[ -z "$recovered" ]]; then
+    # No credential found in any previous log — nothing to recover; caller will auto-reset
+    return 1
   fi
 
+  if curl -skf "${ES_LOCAL_URL}/_cluster/health" \
+      -u "elastic:${recovered}" -o /dev/null 2>/dev/null; then
+    ES_PASSWORD="$recovered"
+    info "Recovered elastic password from previous install log"
+    return 0
+  fi
+
+  info "Found previous password in log but it no longer works — prompting"
   echo ""
   echo -en "${BOLD}  Enter existing 'elastic' password${NC}: "
   read -rs ES_PASSWORD
