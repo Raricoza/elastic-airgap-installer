@@ -55,6 +55,11 @@ KIBANA_ENC_KEY=""
 
 EPR_URL=""                  # local Elastic Package Registry URL (optional)
 
+CCS_ENABLED=false           # true if CCS access from ECH will be configured
+CCS_PUBLIC_HOST=""          # public IP/hostname ECH will connect to on port 9200
+CCS_API_KEY=""              # cross-cluster API key (encoded) for ECH
+CA_FINGERPRINT=""           # SHA-256 fingerprint of the ES HTTP CA cert
+
 OS_FAMILY=""
 PKG_MANAGER=""
 ARCH=""
@@ -486,6 +491,33 @@ menu_epr() {
   fi
 }
 
+menu_ccs() {
+  step "Cross-Cluster Search from Elastic Cloud Hosted (ECH)"
+  echo ""
+  info "If an ECH deployment will query this cluster via Cross-Cluster Search,"
+  info "the installer can generate a cross-cluster API key and print the steps"
+  info "needed in the ECH console to complete the connection."
+  info ""
+  info "CCS uses standard HTTPS on port 9200 (already opened in the firewall)."
+  info "Ensure any upstream router or security group also allows inbound 9200"
+  info "from ECH's egress IPs."
+  echo ""
+
+  CCS_ENABLED=false
+  CCS_PUBLIC_HOST=""
+  if confirm "  Set up CCS access from ECH?" "N"; then
+    CCS_ENABLED=true
+    local detected_ip
+    detected_ip=$(hostname -I | awk '{print $1}')
+    info "  Enter the IP address or hostname that ECH will use to reach port 9200."
+    info "  Must be publicly routable — not 0.0.0.0 or 127.0.0.1."
+    echo ""
+    prompt "Public host / IP for this Elasticsearch cluster" "$detected_ip"
+    CCS_PUBLIC_HOST="$REPLY"
+    success "CCS enabled — cross-cluster API key will be created after install."
+  fi
+}
+
 menu_passwords() {
   step "User passwords"
   echo ""
@@ -547,6 +579,13 @@ menu_confirm() {
     echo -e "    ${GREEN}${EPR_URL}${NC}"
   else
     echo -e "    ${YELLOW}not configured — integrations will not be installable from Kibana${NC}"
+  fi
+  echo ""
+  echo -e "  ${BOLD}CCS from ECH:${NC}"
+  if [[ "$CCS_ENABLED" == true ]]; then
+    echo -e "    ${GREEN}${CCS_PUBLIC_HOST}:9200${NC}"
+  else
+    echo -e "    ${DIM}not configured${NC}"
   fi
   echo ""
   hr
@@ -744,11 +783,17 @@ configure_kibana() {
   local es_conn_host="$NETWORK_HOST"
   if [[ "$es_conn_host" == "0.0.0.0" ]]; then es_conn_host="127.0.0.1"; fi
 
+  local kibana_pub_host="$KIBANA_HOST"
+  if [[ "$kibana_pub_host" == "0.0.0.0" ]]; then
+    kibana_pub_host=$(hostname -I | awk '{print $1}')
+  fi
+
   cat > "$conf" <<EOF
 # ── Kibana Configuration ──────────────────────────────────────────────────────
 server.port: 5601
 server.host: "${KIBANA_HOST}"
 server.name: "$(hostname -s)"
+server.publicBaseUrl: "http://${kibana_pub_host}:5601"
 
 # Elasticsearch connection
 elasticsearch.hosts: ["https://${es_conn_host}:9200"]
@@ -762,6 +807,10 @@ map.includeElasticMapsService: false
 # Air-gapped: disable usage telemetry
 telemetry.enabled: false
 telemetry.optIn: false
+
+# Air-gapped: disable AI Assistant knowledge-base artifact downloads
+# Remove this line (and configure an LLM connector) to re-enable the AI Assistant
+xpack.observabilityAIAssistant.enabled: false
 
 # Logging
 logging.appenders.file.type: file
@@ -1215,6 +1264,7 @@ print(json.dumps({
     local fingerprint
     fingerprint=$(openssl x509 -fingerprint -sha256 -noout -in "$ca_cert" 2>/dev/null \
       | sed 's/.*=//; s/://g; y/ABCDEF/abcdef/') || true
+    CA_FINGERPRINT="$fingerprint"
     if [[ -n "$fingerprint" ]]; then
       info "Configuring Elasticsearch output with CA fingerprint..."
 
@@ -1301,6 +1351,37 @@ print(d[0]['id'] if d else 'fleet-default-output')" 2>/dev/null || true)
   start_service "elastic-agent"
 }
 
+setup_ccs() {
+  if [[ "$CCS_ENABLED" == false ]]; then return; fi
+  step "Creating cross-cluster API key for ECH"
+
+  wait_for_es || return 0
+
+  info "Creating cross-cluster API key (requires Elasticsearch 8.9+)..."
+  local ccs_key_json
+  ccs_key_json=$(curl -sk -X POST \
+    "${ES_LOCAL_URL}/_security/cross_cluster/api_key" \
+    -u "elastic:${ES_PASSWORD}" \
+    -H "Content-Type: application/json" \
+    -d '{"name":"ech-ccs-key","access":{"search":[{"names":["*"]}]}}' \
+    2>>"$LOG_FILE") || true
+
+  CCS_API_KEY=$(echo "$ccs_key_json" | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(d.get('encoded',''))" 2>/dev/null || true)
+
+  if [[ -n "$CCS_API_KEY" ]]; then
+    log "CREDENTIAL: ccs_api_key_encoded=${CCS_API_KEY}"
+    success "Cross-cluster API key created"
+  else
+    warn "Could not create cross-cluster API key."
+    warn "Create it manually after install:"
+    warn "  POST /_security/cross_cluster/api_key"
+    warn '  {"name":"ech-ccs-key","access":{"search":[{"names":["*"]}]}}'
+    warn "Use the 'encoded' field value in the ECH remote cluster configuration."
+    CCS_API_KEY="(create manually — see instructions above)"
+  fi
+}
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 write_summary() {
   local host_ip
@@ -1333,6 +1414,9 @@ write_summary() {
       echo "  EPR URL:   ${EPR_URL}"
     else
       echo "  EPR URL:   not configured (Fleet integrations unavailable until set)"
+    fi
+    if [[ "$CCS_ENABLED" == true ]]; then
+      echo "  CCS host:  ${CCS_PUBLIC_HOST}:9200"
     fi
     echo ""
     echo "── Packages installed ────────────────────────────────────────────────────"
@@ -1367,6 +1451,33 @@ write_summary() {
     if [[ -n "$FLEET_SERVICE_TOKEN" ]]; then
       echo "  Fleet Server service token"
       echo "    ${FLEET_SERVICE_TOKEN}"
+      echo ""
+    fi
+    if [[ "$CCS_ENABLED" == true ]]; then
+      echo "── Cross-Cluster Search (ECH → on-prem) ──────────────────────────────────"
+      echo "  On-prem Elasticsearch:  https://${CCS_PUBLIC_HOST}:9200"
+      if [[ -n "$CA_FINGERPRINT" ]]; then
+        echo "  CA fingerprint (SHA-256, no colons):"
+        echo "    ${CA_FINGERPRINT}"
+        echo "  CA certificate file:    /etc/elasticsearch/certs/http_ca.crt"
+      fi
+      echo "  Cross-cluster API key (encoded):"
+      echo "    ${CCS_API_KEY}"
+      echo ""
+      echo "  Steps to complete in the ECH console:"
+      echo "  1. Copy /etc/elasticsearch/certs/http_ca.crt to your workstation."
+      echo "  2. ECH deployment → Security → Trusted CA → upload http_ca.crt"
+      echo "  3. ECH deployment → Security → Remote clusters → Add remote cluster:"
+      echo "       Name:    on-prem  (any label)"
+      echo "       Mode:    Proxy"
+      echo "       URL:     https://${CCS_PUBLIC_HOST}:9200"
+      echo "       API key: <paste the encoded key above>"
+      echo "  4. Verify in ECH Dev Console: GET /_remote/info"
+      echo "  5. Run a CCS query:  GET /on-prem:<index-name>/_search"
+      echo ""
+      echo "  NOTE: Agent auto-upgrades from Fleet UI require internet access to"
+      echo "  artifacts.elastic.co — upgrade agents manually or via the Elastic"
+      echo "  Artifact Registry if you set one up locally."
       echo ""
     fi
     echo "── Service management ────────────────────────────────────────────────────"
@@ -1427,6 +1538,7 @@ main() {
   menu_network
   menu_data_dirs
   menu_epr
+  menu_ccs
   menu_passwords
   menu_confirm
 
@@ -1472,6 +1584,7 @@ main() {
     systemctl restart kibana >> "$LOG_FILE" 2>&1 || true
     wait_for_kibana || true
   fi
+  setup_ccs
 
   echo ""
   hr
