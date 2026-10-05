@@ -53,6 +53,8 @@ CUSTOM_KIBANA_PASSWORD=""
 KIBANA_ENROLLMENT_TOKEN=""
 KIBANA_ENC_KEY=""
 
+EPR_URL=""                  # local Elastic Package Registry URL (optional)
+
 OS_FAMILY=""
 PKG_MANAGER=""
 ARCH=""
@@ -290,9 +292,28 @@ check_prerequisites() {
     success "Disk: ${free_gb}GB free on /var/lib — OK"
   fi
 
+  # ── fontconfig (required by Kibana headless PDF/PNG reporting) ───────────────
+  if [[ "$OS_FAMILY" == "rhel" ]]; then
+    if rpm -q fontconfig &>/dev/null; then
+      success "fontconfig — OK"
+    else
+      warn "fontconfig not installed — Kibana PDF/PNG reporting may fail."
+      warn "Install from your internal package mirror before or after this run."
+      checks_passed=false
+    fi
+  else
+    if dpkg -s fontconfig &>/dev/null 2>&1; then
+      success "fontconfig — OK"
+    else
+      warn "fontconfig not installed — Kibana PDF/PNG reporting may fail."
+      warn "Install from your internal package mirror before or after this run."
+      checks_passed=false
+    fi
+  fi
+
   if [[ "$checks_passed" == "false" ]]; then
     echo ""
-    confirm "  System does not meet the recommended specifications. Continue anyway?" "N" \
+    confirm "  System does not meet all recommended specifications. Continue anyway?" "N" \
       || die "Aborted by user."
   else
     success "All prerequisite checks passed"
@@ -441,6 +462,30 @@ menu_data_dirs() {
   success "Data: ${ES_DATA_DIR}   /   Logs: ${ES_LOG_DIR}"
 }
 
+menu_epr() {
+  step "Elastic Package Registry (EPR)"
+  echo ""
+  info "Fleet integrations are fetched from the Elastic Package Registry (EPR)."
+  info "Without a local EPR, you will not be able to install integrations from"
+  info "the Kibana Fleet UI after install."
+  info ""
+  info "EPR runs as a Docker container:"
+  info "  docker run -p 8080:8080 docker.elastic.co/package-registry/distribution:latest"
+  echo ""
+
+  EPR_URL=""
+  if confirm "  Do you have a local EPR running?" "N"; then
+    local detected_ip
+    detected_ip=$(hostname -I | awk '{print $1}')
+    prompt "EPR URL" "http://${detected_ip}:8080"
+    EPR_URL="$REPLY"
+    success "Fleet will use local EPR: ${EPR_URL}"
+  else
+    warn "No local EPR configured — Fleet integrations will not be installable from Kibana."
+    warn "You can add it later: set xpack.fleet.registryUrl in /etc/kibana/kibana.yml"
+  fi
+}
+
 menu_passwords() {
   step "User passwords"
   echo ""
@@ -495,6 +540,13 @@ menu_confirm() {
     echo -e "    kibana_system:  ${GREEN}custom${NC}"
   else
     echo -e "    kibana_system:  ${DIM}auto-generated${NC}"
+  fi
+  echo ""
+  echo -e "  ${BOLD}Fleet EPR:${NC}"
+  if [[ -n "$EPR_URL" ]]; then
+    echo -e "    ${GREEN}${EPR_URL}${NC}"
+  else
+    echo -e "    ${YELLOW}not configured — integrations will not be installable from Kibana${NC}"
   fi
   echo ""
   hr
@@ -649,6 +701,9 @@ http.port: 9200
 # Single-node discovery (no cluster formation)
 discovery.type: single-node
 
+# Air-gapped: disable GeoIP database auto-updates (requires internet)
+ingest.geoip.downloader.enabled: false
+
 # Security (enabled by default in 8.x / 9.x)
 xpack.security.enabled: true
 xpack.security.enrollment.enabled: true
@@ -701,12 +756,29 @@ elasticsearch.hosts: ["https://${es_conn_host}:9200"]
 # Required for Fleet
 xpack.encryptedSavedObjects.encryptionKey: "${KIBANA_ENC_KEY}"
 
+# Air-gapped: disable Elastic Maps Service tiles (requires internet)
+map.includeElasticMapsService: false
+
+# Air-gapped: disable usage telemetry
+telemetry.enabled: false
+telemetry.optIn: false
+
 # Logging
 logging.appenders.file.type: file
 logging.appenders.file.fileName: /var/log/kibana/kibana.log
 logging.appenders.file.layout.type: json
 logging.root.appenders: [default, file]
 EOF
+
+  # Append local EPR URL if configured
+  if [[ -n "$EPR_URL" ]]; then
+    {
+      echo ""
+      echo "# Air-gapped: local Elastic Package Registry"
+      echo "xpack.fleet.registryUrl: \"${EPR_URL}\""
+    } >> "$conf"
+    info "Fleet configured to use local EPR: ${EPR_URL}"
+  fi
 
   open_firewall_port 5601
   success "Kibana configured"
@@ -1257,6 +1329,12 @@ write_summary() {
     echo "  ES Logs:   ${ES_LOG_DIR}"
     echo "  Log file:  ${LOG_FILE}"
     echo ""
+    if [[ -n "$EPR_URL" ]]; then
+      echo "  EPR URL:   ${EPR_URL}"
+    else
+      echo "  EPR URL:   not configured (Fleet integrations unavailable until set)"
+    fi
+    echo ""
     echo "── Packages installed ────────────────────────────────────────────────────"
     echo "  $(basename "$ES_PKG")"
     echo "  $(basename "$KIBANA_PKG")"
@@ -1348,6 +1426,7 @@ main() {
   menu_server_name
   menu_network
   menu_data_dirs
+  menu_epr
   menu_passwords
   menu_confirm
 

@@ -137,6 +137,52 @@ Both files are written to the same directory as the script:
 - Fleet Server service token
 - CA certificate path (for HTTPS connections to Elasticsearch)
 
+## Air-gapped considerations
+
+The following services are automatically disabled or configured by the installer to prevent failed outbound connection attempts:
+
+| Service | Setting applied | Why |
+|---|---|---|
+| GeoIP database updates | `ingest.geoip.downloader.enabled: false` in `elasticsearch.yml` | ES polls `geoip.elastic.co` on startup |
+| Elastic Maps Service | `map.includeElasticMapsService: false` in `kibana.yml` | Map tile backgrounds come from `tiles.maps.elastic.co` |
+| Usage telemetry | `telemetry.enabled: false` / `telemetry.optIn: false` in `kibana.yml` | Prevents outbound usage-data calls |
+| Fleet Package Registry | `xpack.fleet.registryUrl` set if a local EPR URL is provided | Fleet fetches integrations from `epr.elastic.co` by default |
+
+### Elastic Package Registry (EPR)
+
+Without a local EPR, you **cannot install integrations** (System, Nginx, Windows, custom) from the Fleet UI after install. The installer prompts for an EPR URL during configuration.
+
+To deploy EPR as a Docker container on a host with access to Docker Hub (then transfer the image or use an internal registry):
+
+```bash
+# Pull the image on an internet-connected machine
+docker pull docker.elastic.co/package-registry/distribution:latest
+
+# Save and transfer
+docker save docker.elastic.co/package-registry/distribution:latest | gzip > epr.tar.gz
+
+# Load on the air-gapped host
+docker load < epr.tar.gz
+
+# Run EPR (port 8080 by default)
+docker run -d --name epr -p 8080:8080 \
+  docker.elastic.co/package-registry/distribution:latest
+```
+
+If you didn't configure EPR during install, add it to `/etc/kibana/kibana.yml` and restart Kibana:
+
+```yaml
+xpack.fleet.registryUrl: "http://<epr-host>:8080"
+```
+
+```bash
+systemctl restart kibana
+```
+
+### Kibana reporting (PDF/PNG)
+
+Kibana's reporting feature uses a bundled headless Chromium browser. It requires `fontconfig` and at least one font package to be installed on the host. The installer checks for `fontconfig` and warns if it is missing — install it from your internal package mirror.
+
 ## Security
 
 - TLS is enabled by default on all Elasticsearch HTTP and transport connections
@@ -175,3 +221,8 @@ If `dpkg -i` fails with unmet dependencies, install the missing packages from yo
 - Local `.rpm` / `.deb` installation via `rpm --nosignature` and `dpkg -i`
 - All post-install security, enrollment, and Fleet Server setup identical to the online installer
 - Custom cluster name, node name, data directory, and log directory prompts
+- GeoIP downloader disabled automatically (`ingest.geoip.downloader.enabled: false`)
+- Elastic Maps Service disabled automatically (`map.includeElasticMapsService: false`)
+- Telemetry disabled automatically (`telemetry.enabled: false`)
+- Optional local Elastic Package Registry (EPR) URL prompt; sets `xpack.fleet.registryUrl` if provided
+- `fontconfig` prerequisite check with warning for Kibana PDF/PNG reporting
